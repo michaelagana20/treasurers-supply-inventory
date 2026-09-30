@@ -3,6 +3,7 @@
 *.db-wal
 *.db-shm
 backups/
+data/
 TreasurersSupplyInventory/
 
 # Python and editor files

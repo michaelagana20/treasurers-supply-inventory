@@ -51,9 +51,16 @@ class WorkflowTest(unittest.TestCase):
         self.call("/stock", {"variant_id":a4["variant_id"],"quantity":5,"remarks":"delivery"})
         self.call("/backup", {})
         self.assertTrue(self.call("/state")["backups"])
+        self.call("/archive/variant", {"variant_id":a4["variant_id"]}, 400)
+        self.call("/requests", {"requestor":"Maria","items":[{"variant_id":a4["variant_id"],"quantity":19}]})
+        pending = self.call("/state")["requested"][0]
+        self.call(f"/releases/{pending['id']}", {"items":[{"id":pending["items"][0]["id"],"quantity":19}]})
         self.call("/archive/variant", {"variant_id":a4["variant_id"]})
         active_ids = [v["variant_id"] for s in self.call("/state")["supplies"] for v in s["variants"]]
         self.assertNotIn(a4["variant_id"], active_ids)
+        self.call("/restore/variant", {"variant_id":a4["variant_id"]})
+        restored_ids = [v["variant_id"] for s in self.call("/state")["supplies"] for v in s["variants"]]
+        self.assertIn(a4["variant_id"], restored_ids)
         self.assertTrue(self.call("/state")["released"])
 
     def test_release_cannot_exceed_stock(self):

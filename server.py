@@ -15,9 +15,9 @@ from urllib.parse import urlparse
 APP_VERSION = "1.0.0"
 GITHUB_REPOSITORY = os.environ.get("TSI_GITHUB_REPOSITORY", "")
 ROOT = Path(__file__).resolve().parent
-DATA_DIR = Path(os.environ.get("TSI_DATA_DIR", Path(os.environ.get("LOCALAPPDATA", ROOT)) / "TreasurersSupplyInventory"))
+DATA_DIR = Path(os.environ.get("TSI_DATA_DIR", ROOT / "data"))
 DB_PATH = DATA_DIR / "inventory.db"
-BACKUP_DIR = DATA_DIR / "backups"
+BACKUP_DIR = ROOT / "backups"
 
 
 def now():
@@ -61,6 +61,10 @@ CREATE TABLE IF NOT EXISTS corrections (
  id INTEGER PRIMARY KEY, request_item_id INTEGER NOT NULL REFERENCES request_items(id), quantity INTEGER NOT NULL CHECK(quantity > 0),
  remarks TEXT NOT NULL CHECK(length(trim(remarks)) > 0), created_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS audit_events (
+ id INTEGER PRIMARY KEY, event_type TEXT NOT NULL, entity_type TEXT NOT NULL, entity_id INTEGER,
+ summary TEXT NOT NULL, details TEXT NOT NULL DEFAULT '{}', created_at TEXT NOT NULL
+);
 CREATE INDEX IF NOT EXISTS idx_add_variant ON stock_additions(variant_id);
 CREATE INDEX IF NOT EXISTS idx_item_variant ON request_items(variant_id);
 CREATE INDEX IF NOT EXISTS idx_correction_item ON corrections(request_item_id);
@@ -97,6 +101,36 @@ def inventory(con):
         x["used"] = x["released"] - x["corrected"]
         x["stock"] = x["added"] - x["used"]
     return data
+
+
+def add_event(con, event_type, entity_type, entity_id, summary, details):
+    con.execute("INSERT INTO audit_events(event_type,entity_type,entity_id,summary,details,created_at) VALUES(?,?,?,?,?,?)",
+                (event_type, entity_type, entity_id, summary, json.dumps(details, ensure_ascii=False), now()))
+
+
+def recent_activity(con):
+    events = rows(con.execute("SELECT id,event_type,entity_type,entity_id,summary,details,created_at FROM audit_events ORDER BY id DESC"))
+    for e in events:
+        try: e["details"] = json.loads(e["details"])
+        except Exception: e["details"] = {}
+    for a in rows(con.execute("""SELECT a.id,a.quantity,a.remarks,a.created_at,s.name supply_name,v.name variant_name,v.is_direct
+            FROM stock_additions a JOIN variants v ON v.id=a.variant_id JOIN supplies s ON s.id=v.supply_id ORDER BY a.id DESC""")):
+        events.append({"id":a["id"],"event_type":"STOCK_ADDED","entity_type":"stock_addition","entity_id":a["id"],
+            "summary":f"Added {a['quantity']} to {a['supply_name'] if a['is_direct'] else a['supply_name']+' — '+a['variant_name']}",
+            "details":{"Supply":a["supply_name"],"Variant":"Direct stock" if a["is_direct"] else a["variant_name"],"Quantity added":a["quantity"],"Remarks":a["remarks"] or "No remarks"},"created_at":a["created_at"]})
+    for r in rows(con.execute("""SELECT r.id,r.status,r.created_at,r.released_at,q.name requestor,
+            (SELECT COUNT(*) FROM request_items i WHERE i.request_id=r.id) item_count FROM requests r JOIN requestors q ON q.id=r.requestor_id ORDER BY r.id DESC""")):
+        when = r["released_at"] if r["status"] == "RELEASED" else r["created_at"]
+        events.append({"id":r["id"],"event_type":r["status"],"entity_type":"request","entity_id":r["id"],
+            "summary":f"Request #{r['id']} {'released to' if r['status']=='RELEASED' else 'submitted by'} {r['requestor']}",
+            "details":{"Request number":r["id"],"Requestor":r["requestor"],"Status":r["status"].title(),"Line items":r["item_count"]},"created_at":when})
+    for c in rows(con.execute("""SELECT c.id,c.quantity,c.remarks,c.created_at,r.id request_id,s.name supply_name,v.name variant_name,v.is_direct,q.name requestor
+            FROM corrections c JOIN request_items i ON i.id=c.request_item_id JOIN requests r ON r.id=i.request_id JOIN requestors q ON q.id=r.requestor_id
+            JOIN variants v ON v.id=i.variant_id JOIN supplies s ON s.id=v.supply_id ORDER BY c.id DESC""")):
+        events.append({"id":c["id"],"event_type":"CORRECTION","entity_type":"correction","entity_id":c["id"],
+            "summary":f"Returned {c['quantity']} to {c['supply_name'] if c['is_direct'] else c['supply_name']+' — '+c['variant_name']}",
+            "details":{"Request number":c["request_id"],"Requestor":c["requestor"],"Quantity returned":c["quantity"],"Remarks":c["remarks"]},"created_at":c["created_at"]})
+    return sorted(events, key=lambda x:x["created_at"], reverse=True)
 
 
 def request_data(con, status):
@@ -153,6 +187,16 @@ class Handler(SimpleHTTPRequestHandler):
                             match = {"id": v["supply_id"], "name": v["supply_name"], "variants": []}
                             supplies.append(match)
                         match["variants"].append(v)
+                    archived_variants = rows(con.execute("""SELECT v.id variant_id,v.supply_id,v.name variant_name,v.detail_name,s.name supply_name,
+                        COALESCE((SELECT SUM(quantity) FROM stock_additions a WHERE a.variant_id=v.id),0) added,
+                        COALESCE((SELECT SUM(released_qty) FROM request_items i JOIN requests r ON r.id=i.request_id WHERE i.variant_id=v.id AND r.status='RELEASED'),0) released,
+                        COALESCE((SELECT SUM(c.quantity) FROM corrections c JOIN request_items i ON i.id=c.request_item_id WHERE i.variant_id=v.id),0) corrected
+                        FROM variants v JOIN supplies s ON s.id=v.supply_id WHERE v.archived=1 AND s.archived=0 ORDER BY s.name,v.name"""))
+                    for v in archived_variants:
+                        v["used"] = v["released"] - v["corrected"]
+                        v["stock"] = v["added"] - v["used"]
+                    for s in supplies:
+                        s["archived_variants"] = [v for v in archived_variants if v["supply_id"] == s["id"]]
                     result = {
                         "version": APP_VERSION, "repository": GITHUB_REPOSITORY, "supplies": supplies,
                         "requestors": rows(con.execute("SELECT name FROM requestors ORDER BY name")),
@@ -164,6 +208,7 @@ class Handler(SimpleHTTPRequestHandler):
                             FROM corrections c JOIN request_items i ON i.id=c.request_item_id JOIN requests r ON r.id=i.request_id
                             JOIN requestors q ON q.id=r.requestor_id JOIN variants v ON v.id=i.variant_id JOIN supplies s ON s.id=v.supply_id
                             ORDER BY c.id DESC LIMIT 30""")),
+                        "activities": recent_activity(con), "backup_dir": str(BACKUP_DIR),
                         "backups": [p.name for p in sorted(BACKUP_DIR.glob("*.db"), reverse=True)] if BACKUP_DIR.exists() else []
                     }
                     return self.send_json(result)
@@ -271,22 +316,51 @@ class Handler(SimpleHTTPRequestHandler):
                     pending = con.execute("""SELECT COUNT(*) FROM request_items i JOIN requests r ON r.id=i.request_id
                         JOIN variants v ON v.id=i.variant_id WHERE v.supply_id=? AND r.status='REQUESTED'""", (sid,)).fetchone()[0]
                     if pending: raise APIError("This supply is used by a pending request. Release that request before archiving it.")
-                    if not con.execute("SELECT 1 FROM supplies WHERE id=? AND archived=0", (sid,)).fetchone(): raise APIError("Supply not found.")
+                    supply = con.execute("SELECT name FROM supplies WHERE id=? AND archived=0", (sid,)).fetchone()
+                    if not supply: raise APIError("Supply not found.")
+                    balances = rows(con.execute(inventory_sql("AND s.id=?"), (sid,)))
+                    remaining = sum(x["added"] - (x["released"] - x["corrected"]) for x in balances)
+                    if remaining != 0: raise APIError(f"This supply still has {remaining} remaining. It can only be archived when fully used.")
                     con.execute("UPDATE supplies SET archived=1 WHERE id=?", (sid,))
+                    add_event(con,"SUPPLY_ARCHIVED","supply",sid,f"Archived supply {supply['name']}",{"Supply":supply["name"],"Remaining stock":remaining})
                 elif path == "/api/archive/variant":
                     vid = int(data.get("variant_id"))
                     pending = con.execute("""SELECT COUNT(*) FROM request_items i JOIN requests r ON r.id=i.request_id
                         WHERE i.variant_id=? AND r.status='REQUESTED'""", (vid,)).fetchone()[0]
                     if pending: raise APIError("This variant is used by a pending request. Release that request before archiving it.")
-                    variant = con.execute("SELECT is_direct FROM variants WHERE id=? AND archived=0", (vid,)).fetchone()
+                    variant = con.execute("SELECT v.is_direct,v.name,s.name supply_name FROM variants v JOIN supplies s ON s.id=v.supply_id WHERE v.id=? AND v.archived=0", (vid,)).fetchone()
                     if not variant: raise APIError("Variant not found.")
                     if variant["is_direct"]: raise APIError("Archive the main supply instead of its direct stock record.")
+                    balance = con.execute(inventory_sql("AND v.id=?"), (vid,)).fetchone()
+                    remaining = balance["added"] - (balance["released"] - balance["corrected"])
+                    if remaining != 0: raise APIError(f"This variant still has {remaining} remaining. It can only be archived when fully used.")
                     con.execute("UPDATE variants SET archived=1 WHERE id=?", (vid,))
+                    add_event(con,"VARIANT_ARCHIVED","variant",vid,f"Archived variant {variant['supply_name']} — {variant['name']}",
+                              {"Supply":variant["supply_name"],"Variant":variant["name"],"Remaining stock":remaining})
+                elif path == "/api/restore/variant":
+                    vid = int(data.get("variant_id"))
+                    variant = con.execute("""SELECT v.name,s.name supply_name,s.archived supply_archived FROM variants v
+                        JOIN supplies s ON s.id=v.supply_id WHERE v.id=? AND v.archived=1""", (vid,)).fetchone()
+                    if not variant: raise APIError("Archived variant not found.")
+                    if variant["supply_archived"]: raise APIError("Restore the main supply before restoring this variant.")
+                    con.execute("UPDATE variants SET archived=0 WHERE id=?", (vid,))
+                    add_event(con,"VARIANT_RESTORED","variant",vid,f"Restored variant {variant['supply_name']} — {variant['name']}",
+                              {"Supply":variant["supply_name"],"Variant":variant["name"]})
                 elif path == "/api/backup":
                     BACKUP_DIR.mkdir(parents=True, exist_ok=True)
                     dest = BACKUP_DIR / (datetime.now().strftime("inventory-%Y%m%d-%H%M%S") + ".db")
                     out = sqlite3.connect(dest); con.backup(out); out.close()
                     return self.send_json({"ok": True, "file": dest.name})
+                elif path == "/api/reset":
+                    if data.get("confirm") != "RESET DATABASE": raise APIError("Type RESET DATABASE to confirm.")
+                    BACKUP_DIR.mkdir(parents=True, exist_ok=True)
+                    dest = BACKUP_DIR / (datetime.now().strftime("before-reset-%Y%m%d-%H%M%S") + ".db")
+                    out = sqlite3.connect(dest); con.backup(out); out.close()
+                    con.execute("BEGIN IMMEDIATE")
+                    for table in ("corrections","request_items","requests","requestors","stock_additions","variants","supplies","audit_events"):
+                        con.execute(f"DELETE FROM {table}")
+                    con.commit()
+                    return self.send_json({"ok": True, "safety_backup": dest.name})
                 else: raise APIError("Not found.", 404)
             self.send_json({"ok": True})
         except APIError as e: self.send_json({"error": e.message}, e.status)

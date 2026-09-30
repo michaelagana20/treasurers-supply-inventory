@@ -9,7 +9,7 @@ Local, offline-first supply inventory for the Treasurer's Office, care of Samboy
 3. Double-click `launcher.bat`. The default browser opens automatically.
 4. Keep the terminal window open while using the app. Close it or press Ctrl+C to stop the server.
 
-No internet connection or package installation is required. By default the database is stored at `%LOCALAPPDATA%\TreasurersSupplyInventory\inventory.db`, outside the application folder, so replacing application files during an update does not overwrite records.
+No internet connection or package installation is required. The live database is stored in the visible application data folder at `data\inventory.db`, for example `C:\TIS\data\inventory.db`. Application updates must preserve the entire `data` folder.
 
 To make a desktop shortcut, right-click `launcher.bat`, choose **Show more options > Send to > Desktop (create shortcut)**, then rename it to **Supply Inventory**.
 
@@ -32,11 +32,11 @@ Quantities are whole units in version 1. If an office stocks packs and pieces se
 
 ## Backup and restore
 
-Open **Settings > Backup & Restore**. **Create database backup** makes a timestamped, transaction-safe copy in `%LOCALAPPDATA%\TreasurersSupplyInventory\backups`.
+Open **Settings > Backup & Restore**. **Create database backup** makes a timestamped, transaction-safe copy in the application's visible `backups` folder, for example `C:\TIS\backups`.
 
 To restore, choose a backup, click **Restore**, and type `RESTORE`. The selected database is integrity-checked first. Immediately before replacement, the app creates an additional `before-restore-...db` safety copy beside the live database. Stop other copies of the app before restoring.
 
-For protection against computer or drive failure, periodically copy the entire `%LOCALAPPDATA%\TreasurersSupplyInventory` folder to an approved external drive. Treat backups as confidential office records.
+For protection against computer or drive failure, periodically copy the application's `data` and `backups` folders to an approved external drive. Treat backups as confidential office records.
 
 ## Updating without losing data
 
@@ -46,7 +46,7 @@ Before updating:
 
 1. Create a manual backup and stop the app.
 2. Replace the application/code folder with the downloaded release.
-3. Do not remove `%LOCALAPPDATA%\TreasurersSupplyInventory`.
+3. Do not remove or overwrite the application's `data` or `backups` folders.
 4. Start the new version. It reuses the database in that separate data directory.
 
 Version 1's update notice opens the GitHub release download page; it never installs an update automatically.
