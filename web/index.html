@@ -1,0 +1,49 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="theme-color" content="#174d3a">
+  <title>Treasurer's Supply Inventory</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <div class="shell">
+    <aside id="sidebar">
+      <div class="brand">
+        <div class="brand-mark" aria-hidden="true">TO</div>
+        <div><strong>Supply Inventory</strong><span>Treasurer's Office</span></div>
+      </div>
+      <nav id="nav" aria-label="Primary navigation"></nav>
+      <div class="sidebar-foot">
+        <span class="status-dot"></span>
+        <div><strong>Local &amp; secure</strong><small>Data stays on this computer</small></div>
+      </div>
+    </aside>
+    <div class="workspace">
+      <div class="topbar">
+        <button class="menu-button secondary" onclick="toggleNav()" aria-label="Open navigation">☰</button>
+        <div id="pageContext"><strong>Dashboard</strong><span>Overview of your supply inventory</span></div>
+        <div class="user-chip"><span>S</span><div><strong>Samboy</strong><small>Inventory custodian</small></div></div>
+      </div>
+      <main id="app"><div class="loading"><i></i><p>Loading inventory…</p></div></main>
+    </div>
+  </div>
+  <div id="scrim" onclick="toggleNav(false)"></div>
+  <div id="toast" role="status" aria-live="polite"></div>
+  <div id="modal" class="modal" aria-hidden="true">
+    <div class="modal-backdrop" onclick="closeDialog()"></div>
+    <section class="modal-card" role="dialog" aria-modal="true" aria-labelledby="modalTitle">
+      <div class="modal-head"><div><h2 id="modalTitle"></h2><p id="modalSubtitle"></p></div><button type="button" class="modal-close" onclick="closeDialog()" aria-label="Close">×</button></div>
+      <form id="modalForm"><div id="modalBody"></div><div class="modal-actions"><button type="button" class="secondary" onclick="closeDialog()">Cancel</button><button id="modalConfirm" type="submit">Save</button></div></form>
+    </section>
+  </div>
+  <div id="drawer" class="drawer" aria-hidden="true">
+    <div class="drawer-backdrop" onclick="closeDrawer()"></div>
+    <aside class="drawer-panel" role="dialog" aria-modal="true" aria-labelledby="drawerTitle">
+      <div id="drawerContent"></div>
+    </aside>
+  </div>
+  <script src="app.js"></script>
+</body>
+</html>
