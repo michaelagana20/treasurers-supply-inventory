@@ -16,4 +16,9 @@ venv/
 
 # Generated release archives
 dist/
+build/
+.build-deps/
+*.spec
+TreasurersSupplyInventory.exe
+app_icon.ico
 *.zip

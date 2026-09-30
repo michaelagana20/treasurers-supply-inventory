@@ -4,6 +4,19 @@ Local, offline-first supply inventory for the Treasurer's Office, care of Samboy
 
 ## Install and start on Windows
 
+### Recommended standalone EXE
+
+1. Copy `TreasurersSupplyInventory.exe` to a stable writable folder such as `C:\TreasurersSupplyInventory`.
+2. Double-click the EXE. It opens the app in the default browser without displaying a command window.
+3. While running, the blue-and-yellow **TO** icon appears in the Windows notification area (it may be under the **^** hidden-icons button).
+4. Right-click the tray icon to open the app, open its data folder, or safely exit the local server.
+
+The tray menu also lets staff enable or disable **Run when Windows starts** and choose whether startup opens a new browser tab, requests a new browser window, or starts quietly without opening the browser. These preferences are stored locally in `data\tray-settings.json`. The local address is `http://localhost:8765`.
+
+The EXE creates `data\inventory.db` and `backups\` beside itself. In this project, run `C:\TIS\TreasurersSupplyInventory.exe` so it uses the existing `C:\TIS\data` and `C:\TIS\backups` folders. When updating, replace only the EXE and leave those folders in place.
+
+### Running from source
+
 1. Install Python 3.10 or newer from python.org. During installation, enable **Add Python to PATH**.
 2. Copy this application folder to a stable location such as `C:\TreasurersSupplyInventory`.
 3. Double-click `launcher.bat`. The default browser opens automatically.
@@ -12,6 +25,8 @@ Local, offline-first supply inventory for the Treasurer's Office, care of Samboy
 No internet connection or package installation is required. The live database is stored in the visible application data folder at `data\inventory.db`, for example `C:\TIS\data\inventory.db`. Application updates must preserve the entire `data` folder.
 
 To make a desktop shortcut, right-click `launcher.bat`, choose **Show more options > Send to > Desktop (create shortcut)**, then rename it to **Supply Inventory**.
+
+To rebuild the standalone executable on the development computer, run `powershell -ExecutionPolicy Bypass -File .\build_exe.ps1`. Build-only packages are kept in `.build-deps` and are not needed by end users.
 
 Advanced options:
 

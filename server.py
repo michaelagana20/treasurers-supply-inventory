@@ -1,23 +1,31 @@
 import argparse
+import io
 import json
 import os
 import shutil
 import sqlite3
+import sys
 import threading
 import urllib.error
 import urllib.request
 import webbrowser
+import zipfile
 from datetime import datetime
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
+from xml.sax.saxutils import escape, quoteattr
 
 APP_VERSION = "1.0.0"
-GITHUB_REPOSITORY = os.environ.get("TSI_GITHUB_REPOSITORY", "")
-ROOT = Path(__file__).resolve().parent
-DATA_DIR = Path(os.environ.get("TSI_DATA_DIR", ROOT / "data"))
+GITHUB_REPOSITORY = os.environ.get("TSI_GITHUB_REPOSITORY", "michaelagana20/treasurers-supply-inventory")
+FROZEN = bool(getattr(sys, "frozen", False))
+APP_DIR = Path(sys.executable).resolve().parent if FROZEN else Path(__file__).resolve().parent
+RESOURCE_DIR = Path(getattr(sys, "_MEIPASS", APP_DIR))
+DATA_DIR = Path(os.environ.get("TSI_DATA_DIR", APP_DIR / "data"))
 DB_PATH = DATA_DIR / "inventory.db"
-BACKUP_DIR = ROOT / "backups"
+BACKUP_DIR = APP_DIR / "backups"
+TRAY_CONFIG_PATH = DATA_DIR / "tray-settings.json"
+STARTUP_VALUE_NAME = "TreasurersSupplyInventory"
 
 
 def now():
@@ -103,6 +111,25 @@ def inventory(con):
     return data
 
 
+def inventory_as_of(con, end=""):
+    if not end:
+        return inventory(con)
+    data = rows(con.execute("""
+        SELECT s.id supply_id,s.name supply_name,v.id variant_id,v.name variant_name,v.detail_name,v.is_direct,
+          COALESCE((SELECT SUM(quantity) FROM stock_additions a WHERE a.variant_id=v.id AND date(a.created_at)<=?),0) added,
+          COALESCE((SELECT SUM(released_qty) FROM request_items i JOIN requests r ON r.id=i.request_id
+                    WHERE i.variant_id=v.id AND r.status='RELEASED' AND date(r.released_at)<=?),0) released,
+          COALESCE((SELECT SUM(c.quantity) FROM corrections c JOIN request_items i ON i.id=c.request_item_id
+                    WHERE i.variant_id=v.id AND date(c.created_at)<=?),0) corrected
+        FROM supplies s JOIN variants v ON v.supply_id=s.id
+        WHERE s.archived=0 AND v.archived=0 AND date(s.created_at)<=? AND date(v.created_at)<=?
+        ORDER BY s.name,v.is_direct DESC,v.name""", (end,end,end,end,end)))
+    for item in data:
+        item["used"] = item["released"] - item["corrected"]
+        item["stock"] = item["added"] - item["used"]
+    return data
+
+
 def add_event(con, event_type, entity_type, entity_id, summary, details):
     con.execute("INSERT INTO audit_events(event_type,entity_type,entity_id,summary,details,created_at) VALUES(?,?,?,?,?,?)",
                 (event_type, entity_type, entity_id, summary, json.dumps(details, ensure_ascii=False), now()))
@@ -145,6 +172,126 @@ def request_data(con, status):
     return reqs
 
 
+def report_rows(con, report_type, start="", end=""):
+    date_clause, params = "", []
+    if start:
+        date_clause += " AND date({date_field})>=?"
+        params.append(start)
+    if end:
+        date_clause += " AND date({date_field})<=?"
+        params.append(end)
+    if report_type == "inventory":
+        data = inventory_as_of(con, end)
+        return {
+            "name": "Inventory Status",
+            "headers": ["Main Supply", "Stock Type", "Variant", "Detailed Name", "Total Added", "Released", "Returned", "Net Used", "Remaining", "% Remaining", "Stock Status"],
+            "rows": [[x["supply_name"], "Direct stock" if x["is_direct"] else "Variant", "" if x["is_direct"] else x["variant_name"], x["detail_name"] or "", x["added"], x["released"], x["corrected"], x["used"], x["stock"], (x["stock"] / x["added"]) if x["added"] else 0, "Out of stock" if x["stock"] <= 0 else "Low" if x["added"] and x["stock"] / x["added"] <= .2 else "Available"] for x in data],
+            "percent_cols": {9}
+        }
+    if report_type == "stock":
+        sql = """SELECT a.created_at,s.name supply_name,v.name variant_name,v.detail_name,v.is_direct,a.quantity,a.remarks
+            FROM stock_additions a JOIN variants v ON v.id=a.variant_id JOIN supplies s ON s.id=v.supply_id
+            WHERE 1=1 {filters} ORDER BY a.created_at DESC,a.id DESC""".format(filters=date_clause.format(date_field="a.created_at"))
+        data = rows(con.execute(sql, params))
+        return {"name":"Stock Additions","headers":["Date Added","Main Supply","Stock Type","Variant","Detailed Name","Quantity Added","Remarks"],
+            "rows":[[x["created_at"],x["supply_name"],"Direct stock" if x["is_direct"] else "Variant","" if x["is_direct"] else x["variant_name"],x["detail_name"] or "",x["quantity"],x["remarks"] or ""] for x in data], "date_cols":{0}}
+    if report_type == "requests":
+        sql = """SELECT r.id,r.status,r.created_at,r.released_at,q.name requestor,s.name supply_name,v.name variant_name,v.detail_name,v.is_direct,
+            i.requested_qty,COALESCE(i.released_qty,0) released_qty,COALESCE((SELECT SUM(c.quantity) FROM corrections c WHERE c.request_item_id=i.id),0) returned_qty
+            FROM requests r JOIN requestors q ON q.id=r.requestor_id JOIN request_items i ON i.request_id=r.id
+            JOIN variants v ON v.id=i.variant_id JOIN supplies s ON s.id=v.supply_id
+            WHERE 1=1 {filters} ORDER BY r.created_at DESC,r.id DESC,i.id""".format(filters=date_clause.format(date_field="COALESCE(r.released_at,r.created_at)"))
+        data = rows(con.execute(sql, params))
+        return {"name":"Requests and Releases","headers":["Request No.","Requestor","Status","Requested Date","Released Date","Main Supply","Variant","Detailed Name","Requested Qty","Released Qty","Returned Qty","Net Used"],
+            "rows":[[x["id"],x["requestor"],x["status"].title(),x["created_at"],x["released_at"] or "",x["supply_name"],"Direct stock" if x["is_direct"] else x["variant_name"],x["detail_name"] or "",x["requested_qty"],x["released_qty"],x["returned_qty"],x["released_qty"]-x["returned_qty"]] for x in data], "date_cols":{3,4}}
+    if report_type == "corrections":
+        sql = """SELECT c.created_at,r.id request_id,q.name requestor,s.name supply_name,v.name variant_name,v.detail_name,v.is_direct,
+            i.released_qty,c.quantity,c.remarks
+            FROM corrections c JOIN request_items i ON i.id=c.request_item_id JOIN requests r ON r.id=i.request_id
+            JOIN requestors q ON q.id=r.requestor_id JOIN variants v ON v.id=i.variant_id JOIN supplies s ON s.id=v.supply_id
+            WHERE 1=1 {filters} ORDER BY c.created_at DESC,c.id DESC""".format(filters=date_clause.format(date_field="c.created_at"))
+        data = rows(con.execute(sql, params))
+        return {"name":"Corrections","headers":["Correction Date","Request No.","Requestor","Main Supply","Variant","Detailed Name","Original Released Qty","Quantity Returned","Remarks"],
+            "rows":[[x["created_at"],x["request_id"],x["requestor"],x["supply_name"],"Direct stock" if x["is_direct"] else x["variant_name"],x["detail_name"] or "",x["released_qty"],x["quantity"],x["remarks"]] for x in data], "date_cols":{0}}
+    raise APIError("Unknown report type.")
+
+
+def excel_column(number):
+    result = ""
+    while number:
+        number, remainder = divmod(number - 1, 26)
+        result = chr(65 + remainder) + result
+    return result
+
+
+def xml_text(value):
+    value = "" if value is None else str(value)
+    return escape("".join(ch for ch in value if ch in "\t\n\r" or ord(ch) >= 32))
+
+
+def excel_datetime(value):
+    parsed = datetime.fromisoformat(str(value))
+    parsed = parsed.replace(tzinfo=None)
+    origin = datetime(1899, 12, 30)
+    return (parsed - origin).total_seconds() / 86400
+
+
+def friendly_date(value):
+    if not value:
+        return ""
+    return datetime.strptime(value, "%Y-%m-%d").strftime("%b %d, %Y").replace(" 0", " ")
+
+
+def build_xlsx(sheets):
+    created = datetime.now().astimezone().isoformat(timespec="seconds")
+    created_label = datetime.now().astimezone().strftime("%b %d, %Y at %I:%M %p").replace(" 0", " ")
+    sheet_xml, rels, workbook_sheets, content_sheets = [], [], [], []
+    for sheet_index, spec in enumerate(sheets, 1):
+        headers, data = spec["headers"], spec["rows"]
+        columns = max(1, len(headers)); last_col = excel_column(columns); last_row = 4 + len(data)
+        widths = []
+        for col in range(columns):
+            sample = [headers[col]] + [row[col] if col < len(row) else "" for row in data[:250]]
+            widths.append(min(45, max(11, max(len(str(v or "")) for v in sample) + 2)))
+        rows_xml = [f'<row r="1" ht="24" customHeight="1"><c r="A1" s="1" t="inlineStr"><is><t>{xml_text(spec["name"])}</t></is></c></row>',
+                    f'<row r="2"><c r="A2" s="3" t="inlineStr"><is><t>Generated {xml_text(created_label)} · Treasurer\'s Office Supply Inventory</t></is></c></row>']
+        header_cells = "".join(f'<c r="{excel_column(i+1)}4" s="2" t="inlineStr"><is><t>{xml_text(value)}</t></is></c>' for i, value in enumerate(headers))
+        rows_xml.append(f'<row r="4" ht="22" customHeight="1">{header_cells}</row>')
+        percent_cols = spec.get("percent_cols", set())
+        date_cols = spec.get("date_cols", set())
+        for row_number, values in enumerate(data, 5):
+            cells = []
+            for col, value in enumerate(values):
+                ref = f"{excel_column(col+1)}{row_number}"
+                if col in date_cols and value:
+                    cells.append(f'<c r="{ref}" s="5"><v>{excel_datetime(value)}</v></c>')
+                elif isinstance(value, (int, float)) and not isinstance(value, bool):
+                    cells.append(f'<c r="{ref}" s="{4 if col in percent_cols else 0}"><v>{value}</v></c>')
+                else:
+                    cells.append(f'<c r="{ref}" t="inlineStr"><is><t>{xml_text(value)}</t></is></c>')
+            rows_xml.append(f'<row r="{row_number}">{"".join(cells)}</row>')
+        cols_xml = "".join(f'<col min="{i+1}" max="{i+1}" width="{width}" customWidth="1"/>' for i, width in enumerate(widths))
+        merge = f'<mergeCells count="1"><mergeCell ref="A1:{last_col}1"/></mergeCells>' if columns > 1 else ""
+        auto_filter = f'<autoFilter ref="A4:{last_col}{last_row}"/>' if data else ""
+        sheet_xml.append(f'''<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetViews><sheetView workbookViewId="0"><pane ySplit="4" topLeftCell="A5" activePane="bottomLeft" state="frozen"/></sheetView></sheetViews><cols>{cols_xml}</cols><sheetData>{"".join(rows_xml)}</sheetData>{merge}{auto_filter}<pageMargins left="0.3" right="0.3" top="0.5" bottom="0.5" header="0.2" footer="0.2"/></worksheet>''')
+        workbook_sheets.append(f'<sheet name={quoteattr(spec["name"][:31])} sheetId="{sheet_index}" r:id="rId{sheet_index}"/>')
+        rels.append(f'<Relationship Id="rId{sheet_index}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet{sheet_index}.xml"/>')
+        content_sheets.append(f'<Override PartName="/xl/worksheets/sheet{sheet_index}.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>')
+    styles = '''<?xml version="1.0" encoding="UTF-8" standalone="yes"?><styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><numFmts count="1"><numFmt numFmtId="164" formatCode="mmm d, yyyy h:mm AM/PM"/></numFmts><fonts count="4"><font><sz val="10"/><name val="Aptos"/></font><font><b/><sz val="16"/><color rgb="FF063F74"/><name val="Aptos"/></font><font><b/><sz val="10"/><color rgb="FFFFFFFF"/><name val="Aptos"/></font><font><i/><sz val="9"/><color rgb="FF617789"/><name val="Aptos"/></font></fonts><fills count="3"><fill><patternFill patternType="none"/></fill><fill><patternFill patternType="gray125"/></fill><fill><patternFill patternType="solid"><fgColor rgb="FF075CA8"/><bgColor indexed="64"/></patternFill></fill></fills><borders count="2"><border/><border><bottom style="thin"><color rgb="FFD8E4ED"/></bottom></border></borders><cellStyleXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/></cellStyleXfs><cellXfs count="6"><xf numFmtId="0" fontId="0" fillId="0" borderId="1" xfId="0" applyBorder="1"/><xf numFmtId="0" fontId="1" fillId="0" borderId="0" xfId="0" applyFont="1"/><xf numFmtId="0" fontId="2" fillId="2" borderId="0" xfId="0" applyFont="1" applyFill="1" applyAlignment="1"><alignment horizontal="center" vertical="center"/></xf><xf numFmtId="0" fontId="3" fillId="0" borderId="0" xfId="0" applyFont="1"/><xf numFmtId="10" fontId="0" fillId="0" borderId="1" xfId="0" applyNumberFormat="1" applyBorder="1"/><xf numFmtId="164" fontId="0" fillId="0" borderId="1" xfId="0" applyNumberFormat="1" applyBorder="1"/></cellXfs><cellStyles count="1"><cellStyle name="Normal" xfId="0" builtinId="0"/></cellStyles></styleSheet>'''
+    stream = io.BytesIO()
+    with zipfile.ZipFile(stream, "w", zipfile.ZIP_DEFLATED) as book:
+        book.writestr("[Content_Types].xml", f'''<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/><Override PartName="/xl/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml"/><Override PartName="/docProps/core.xml" ContentType="application/vnd.openxmlformats-package.core-properties+xml"/>{''.join(content_sheets)}</Types>''')
+        book.writestr("_rels/.rels", '''<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/><Relationship Id="rId2" Type="http://schemas.openxmlformats.org/package/2006/relationships/metadata/core-properties" Target="docProps/core.xml"/></Relationships>''')
+        book.writestr("docProps/core.xml", f'''<?xml version="1.0" encoding="UTF-8" standalone="yes"?><cp:coreProperties xmlns:cp="http://schemas.openxmlformats.org/package/2006/metadata/core-properties" xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:dcterms="http://purl.org/dc/terms/" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"><dc:title>Treasurer's Office Supply Inventory Reports</dc:title><dc:creator>Samboy</dc:creator><dcterms:created xsi:type="dcterms:W3CDTF">{xml_text(created)}</dcterms:created></cp:coreProperties>''')
+        book.writestr("xl/workbook.xml", f'''<?xml version="1.0" encoding="UTF-8" standalone="yes"?><workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets>{''.join(workbook_sheets)}</sheets></workbook>''')
+        book.writestr("xl/_rels/workbook.xml.rels", f'''<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">{''.join(rels)}<Relationship Id="rId{len(sheets)+1}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/></Relationships>''')
+        book.writestr("xl/styles.xml", styles)
+        for index, content in enumerate(sheet_xml, 1):
+            book.writestr(f"xl/worksheets/sheet{index}.xml", content)
+    return stream.getvalue()
+
+
 class APIError(Exception):
     def __init__(self, message, status=400):
         self.message, self.status = message, status
@@ -152,7 +299,7 @@ class APIError(Exception):
 
 class Handler(SimpleHTTPRequestHandler):
     def __init__(self, *args, **kwargs):
-        super().__init__(*args, directory=str(ROOT / "web"), **kwargs)
+        super().__init__(*args, directory=str(RESOURCE_DIR / "web"), **kwargs)
 
     def log_message(self, fmt, *args):
         print("[%s] %s" % (self.log_date_time_string(), fmt % args))
@@ -166,6 +313,15 @@ class Handler(SimpleHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(raw)
 
+    def send_xlsx(self, content, filename):
+        self.send_response(200)
+        self.send_header("Content-Type", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+        self.send_header("Content-Disposition", f'attachment; filename="{filename}"')
+        self.send_header("Content-Length", str(len(content)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(content)
+
     def body(self):
         try:
             return json.loads(self.rfile.read(int(self.headers.get("Content-Length", 0))) or b"{}")
@@ -173,7 +329,8 @@ class Handler(SimpleHTTPRequestHandler):
             raise APIError("Invalid request data.")
 
     def do_GET(self):
-        path = urlparse(self.path).path
+        parsed = urlparse(self.path)
+        path = parsed.path
         if not path.startswith("/api/"):
             return super().do_GET()
         try:
@@ -212,6 +369,35 @@ class Handler(SimpleHTTPRequestHandler):
                         "backups": [p.name for p in sorted(BACKUP_DIR.glob("*.db"), reverse=True)] if BACKUP_DIR.exists() else []
                     }
                     return self.send_json(result)
+                if path == "/api/reports/excel":
+                    query = parse_qs(parsed.query)
+                    report_type = query.get("type", ["complete"])[0]
+                    start, end = query.get("start", [""])[0], query.get("end", [""])[0]
+                    for value in (start, end):
+                        if value:
+                            try: datetime.strptime(value, "%Y-%m-%d")
+                            except ValueError: raise APIError("Use valid report dates.")
+                    if start and end and start > end: raise APIError("Start date cannot be after end date.")
+                    report_types = ["inventory", "stock", "requests", "corrections"] if report_type == "complete" else [report_type]
+                    sheets = []
+                    if report_type == "complete":
+                        inv = inventory_as_of(con, end)
+                        if end:
+                            pending = con.execute("SELECT COUNT(*) FROM requests WHERE date(created_at)<=? AND (released_at IS NULL OR date(released_at)>?)", (end,end)).fetchone()[0]
+                            released = con.execute("SELECT COUNT(*) FROM requests WHERE released_at IS NOT NULL AND date(released_at)<=?", (end,)).fetchone()[0]
+                        else:
+                            pending = con.execute("SELECT COUNT(*) FROM requests WHERE status='REQUESTED'").fetchone()[0]
+                            released = con.execute("SELECT COUNT(*) FROM requests WHERE status='RELEASED'").fetchone()[0]
+                        sheets.append({"name":"Report Summary","headers":["Metric","Value"],"rows":[
+                            ["Active main supplies",len({x["supply_id"] for x in inv})],
+                            ["Tracked stock items",len(inv)],["Current units remaining",sum(x["stock"] for x in inv)],
+                            ["Pending requests",pending],["Completed releases",released],
+                            ["Inventory snapshot",f"As of {friendly_date(end)}" if end else "Current"],
+                            ["Transaction report period",f"{friendly_date(start) if start else 'All dates'} to {friendly_date(end) if end else 'Present'}"]]})
+                    sheets.extend(report_rows(con, kind, start, end) for kind in report_types)
+                    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+                    filename = f"supply-{report_type}-report-{stamp}.xlsx"
+                    return self.send_xlsx(build_xlsx(sheets), filename)
                 if path == "/api/update":
                     if not GITHUB_REPOSITORY:
                         return self.send_json({"configured": False, "message": "Set TSI_GITHUB_REPOSITORY to owner/repository to enable update checks."})
@@ -421,12 +607,130 @@ class Handler(SimpleHTTPRequestHandler):
         self.send_json({"ok": True, "safety_copy": safety.name})
 
 
+def load_tray_config():
+    defaults = {"open_behavior": "new_tab"}
+    try:
+        saved = json.loads(TRAY_CONFIG_PATH.read_text(encoding="utf-8"))
+        if saved.get("open_behavior") in {"new_tab", "new_window", "minimized"}:
+            defaults.update(saved)
+    except (OSError, ValueError, TypeError):
+        pass
+    return defaults
+
+
+def save_tray_config(config):
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    TRAY_CONFIG_PATH.write_text(json.dumps(config, indent=2), encoding="utf-8")
+
+
+def startup_enabled():
+    if os.name != "nt" or not FROZEN:
+        return False
+    try:
+        import winreg
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Software\Microsoft\Windows\CurrentVersion\Run") as key:
+            value, _ = winreg.QueryValueEx(key, STARTUP_VALUE_NAME)
+        return Path(value.strip().strip('"')).resolve() == Path(sys.executable).resolve()
+    except (OSError, ValueError):
+        return False
+
+
+def set_startup(enabled):
+    import winreg
+    with winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Software\Microsoft\Windows\CurrentVersion\Run", 0, winreg.KEY_SET_VALUE) as key:
+        if enabled:
+            winreg.SetValueEx(key, STARTUP_VALUE_NAME, 0, winreg.REG_SZ, f'"{sys.executable}"')
+        else:
+            try:
+                winreg.DeleteValue(key, STARTUP_VALUE_NAME)
+            except FileNotFoundError:
+                pass
+
+
+def open_browser_url(url, behavior="new_tab"):
+    if behavior == "new_window":
+        webbrowser.open_new(url)
+    elif behavior != "minimized":
+        webbrowser.open_new_tab(url)
+
+
+def tray_image():
+    from PIL import Image, ImageDraw
+    image = Image.new("RGBA", (64, 64), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(image)
+    draw.ellipse((3, 3, 61, 61), fill="#075ca8", outline="#ffd43b", width=4)
+    draw.polygon(((14, 26), (32, 13), (50, 26)), fill="#ffd43b")
+    draw.rectangle((16, 27, 48, 32), fill="#ffffff")
+    for left in (19, 29, 39):
+        draw.rectangle((left, 32, left + 6, 47), fill="#ffffff")
+    draw.rectangle((14, 47, 50, 52), fill="#ffd43b")
+    return image
+
+
+def run_with_tray(server, url, open_browser=True):
+    import pystray
+    config = load_tray_config()
+
+    def open_app(icon=None, item=None):
+        webbrowser.open_new_tab(url)
+
+    def open_data(icon=None, item=None):
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        os.startfile(DATA_DIR)
+
+    def exit_app(icon, item=None):
+        icon.stop()
+        threading.Thread(target=server.shutdown, daemon=True).start()
+
+    def toggle_startup(icon, item=None):
+        set_startup(not startup_enabled())
+        icon.update_menu()
+
+    def choose_behavior(behavior):
+        def choose(icon, item=None):
+            config["open_behavior"] = behavior
+            save_tray_config(config)
+            icon.update_menu()
+        return choose
+
+    behavior_menu = pystray.Menu(
+        pystray.MenuItem("Open a new tab", choose_behavior("new_tab"), checked=lambda item: config["open_behavior"] == "new_tab", radio=True),
+        pystray.MenuItem("Open a new browser window", choose_behavior("new_window"), checked=lambda item: config["open_behavior"] == "new_window", radio=True),
+        pystray.MenuItem("Start without opening browser", choose_behavior("minimized"), checked=lambda item: config["open_behavior"] == "minimized", radio=True),
+    )
+
+    menu = pystray.Menu(
+        pystray.MenuItem("Open Supply Inventory", open_app, default=True),
+        pystray.MenuItem("Run when Windows starts", toggle_startup, checked=lambda item: startup_enabled()),
+        pystray.MenuItem("When app starts", behavior_menu),
+        pystray.MenuItem("Open Data Folder", open_data),
+        pystray.Menu.SEPARATOR,
+        pystray.MenuItem("Exit", exit_app),
+    )
+    icon = pystray.Icon("TreasurersSupplyInventory", tray_image(), "Treasurer's Supply Inventory", menu)
+    thread = threading.Thread(target=server.serve_forever, name="inventory-server", daemon=True)
+    thread.start()
+    if open_browser:
+        threading.Timer(.8, lambda: open_browser_url(url, config["open_behavior"])).start()
+    try:
+        icon.run()
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
 def main():
     parser = argparse.ArgumentParser(); parser.add_argument("--port", type=int, default=8765); parser.add_argument("--no-browser", action="store_true")
     args = parser.parse_args(); init_db()
-    server = ThreadingHTTPServer(("127.0.0.1", args.port), Handler)
-    url = f"http://127.0.0.1:{args.port}"
+    url = f"http://localhost:{args.port}"
+    try:
+        server = ThreadingHTTPServer(("127.0.0.1", args.port), Handler)
+    except OSError:
+        webbrowser.open_new_tab(url)
+        return
     print(f"Treasurer's Supply Inventory v{APP_VERSION} running at {url}\nData: {DB_PATH}\nPress Ctrl+C to stop.")
+    if FROZEN:
+        return run_with_tray(server, url, not args.no_browser)
     if not args.no_browser: threading.Timer(.8, lambda: webbrowser.open(url)).start()
     try: server.serve_forever()
     except KeyboardInterrupt: pass
