@@ -256,6 +256,41 @@ class Handler(SimpleHTTPRequestHandler):
                     else:
                         vid = con.execute("INSERT INTO variants(supply_id,name,is_direct,created_at) VALUES(?,?,1,?)", (sid,"__DIRECT__",now())).lastrowid
                         if qty: con.execute("INSERT INTO stock_additions(variant_id,quantity,remarks,created_at) VALUES(?,?,?,?)", (vid,qty,"Starting stock",now()))
+                elif path == "/api/supplies/bulk":
+                    entries = data.get("entries") or []
+                    if not entries: raise APIError("Add at least one bulk-entry row.")
+                    grouped = {}
+                    for number, item in enumerate(entries, 1):
+                        supply = str(item.get("supply", "")).strip()
+                        variant = str(item.get("variant", "")).strip()
+                        detail = str(item.get("detail_name", "")).strip()
+                        qty = int(item.get("quantity") or 0)
+                        if not supply: raise APIError(f"Row {number}: supply name is required.")
+                        if qty < 0: raise APIError(f"Row {number}: quantity cannot be negative.")
+                        key = supply.casefold()
+                        grouped.setdefault(key, {"name":supply,"rows":[]})["rows"].append({"variant":variant,"detail":detail,"quantity":qty,"row":number})
+                    for group in grouped.values():
+                        if con.execute("SELECT 1 FROM supplies WHERE name=? COLLATE NOCASE", (group["name"],)).fetchone():
+                            raise APIError(f"Supply already exists: {group['name']}")
+                        has_variants = any(x["variant"] for x in group["rows"])
+                        if has_variants and any(not x["variant"] for x in group["rows"]):
+                            raise APIError(f"{group['name']}: do not mix blank and named variants.")
+                        if not has_variants and len(group["rows"]) > 1:
+                            raise APIError(f"{group['name']}: direct supplies may appear only once.")
+                        names = [x["variant"].casefold() for x in group["rows"] if x["variant"]]
+                        if len(names) != len(set(names)): raise APIError(f"{group['name']}: duplicate variant names.")
+                    created = 0
+                    for group in grouped.values():
+                        sid = con.execute("INSERT INTO supplies(name,created_at) VALUES(?,?)", (group["name"],now())).lastrowid
+                        for item in group["rows"]:
+                            direct = not item["variant"]
+                            vid = con.execute("INSERT INTO variants(supply_id,name,detail_name,is_direct,created_at) VALUES(?,?,?,?,?)",
+                                (sid,"__DIRECT__" if direct else item["variant"],item["detail"],1 if direct else 0,now())).lastrowid
+                            if item["quantity"]:
+                                con.execute("INSERT INTO stock_additions(variant_id,quantity,remarks,created_at) VALUES(?,?,?,?)", (vid,item["quantity"],"Bulk starting stock",now()))
+                        add_event(con,"SUPPLY_CREATED","supply",sid,f"Bulk-created supply {group['name']}",{"Supply":group["name"],"Items":len(group["rows"])})
+                        created += 1
+                    return self.send_json({"ok":True,"created":created})
                 elif path == "/api/variants":
                     sid, name = int(data.get("supply_id")), str(data.get("name", "")).strip()
                     if not name: raise APIError("Variant name is required.")
