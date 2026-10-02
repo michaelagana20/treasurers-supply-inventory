@@ -3,6 +3,7 @@ import io
 import json
 import os
 import shutil
+import socket
 import sqlite3
 import sys
 import threading
@@ -355,7 +356,8 @@ class Handler(SimpleHTTPRequestHandler):
                     for s in supplies:
                         s["archived_variants"] = [v for v in archived_variants if v["supply_id"] == s["id"]]
                     result = {
-                        "version": APP_VERSION, "repository": GITHUB_REPOSITORY, "supplies": supplies,
+                        "version": APP_VERSION, "repository": GITHUB_REPOSITORY,
+                        "local_url": f"http://127.0.0.1:{self.server.server_port}", "supplies": supplies,
                         "requestors": rows(con.execute("SELECT name FROM requestors ORDER BY name")),
                         "requested": request_data(con, "REQUESTED"), "released": request_data(con, "RELEASED"),
                         "recent_additions": rows(con.execute("""SELECT a.id,a.quantity,a.remarks,a.created_at,s.name supply_name,v.name variant_name,v.is_direct
@@ -607,6 +609,15 @@ class Handler(SimpleHTTPRequestHandler):
         self.send_json({"ok": True, "safety_copy": safety.name})
 
 
+class LocalHTTPServer(ThreadingHTTPServer):
+    allow_reuse_address = False
+
+    def server_bind(self):
+        if os.name == "nt":
+            self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+        super().server_bind()
+
+
 def load_tray_config():
     defaults = {"open_behavior": "new_tab"}
     try:
@@ -719,15 +730,35 @@ def run_with_tray(server, url, open_browser=True):
         server.server_close()
 
 
-def main():
-    parser = argparse.ArgumentParser(); parser.add_argument("--port", type=int, default=8765); parser.add_argument("--no-browser", action="store_true")
-    args = parser.parse_args(); init_db()
-    url = f"http://localhost:{args.port}"
+def create_local_server(requested_port=None):
+    if requested_port is not None:
+        server = LocalHTTPServer(("127.0.0.1", requested_port), Handler)
+        return server, server.server_port
+    last_error = None
+    for port in range(8765, 8865):
+        try:
+            server = LocalHTTPServer(("127.0.0.1", port), Handler)
+            return server, server.server_port
+        except OSError as error:
+            last_error = error
     try:
-        server = ThreadingHTTPServer(("127.0.0.1", args.port), Handler)
+        server = LocalHTTPServer(("127.0.0.1", 0), Handler)
+        return server, server.server_port
     except OSError:
-        webbrowser.open_new_tab(url)
+        raise last_error
+
+
+def main():
+    parser = argparse.ArgumentParser(); parser.add_argument("--port", type=int); parser.add_argument("--no-browser", action="store_true")
+    args = parser.parse_args(); init_db()
+    try:
+        server, selected_port = create_local_server(args.port)
+    except OSError as error:
+        print(f"Could not start the local server: {error}")
         return
+    url = f"http://localhost:{selected_port}"
+    if args.port is None and selected_port != 8765:
+        print(f"Port 8765 is already in use. Automatically selected port {selected_port}.")
     print(f"Treasurer's Supply Inventory v{APP_VERSION} running at {url}\nData: {DB_PATH}\nPress Ctrl+C to stop.")
     if FROZEN:
         return run_with_tray(server, url, not args.no_browser)

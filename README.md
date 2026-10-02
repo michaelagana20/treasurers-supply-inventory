@@ -135,7 +135,7 @@ Reset creates a timestamped safety backup before clearing live records.
 1. Obtain the standalone `TreasurersSupplyInventory.exe` build from the application maintainer or a release that includes it.
 2. Copy it into a stable writable folder, such as `C:\TreasurersSupplyInventory`.
 3. Double-click `TreasurersSupplyInventory.exe`.
-4. The application opens at `http://127.0.0.1:8765` in the default browser.
+4. The application opens on localhost in the default browser. It prefers `http://127.0.0.1:8765` and automatically selects the next available port if `8765` is already in use.
 
 While running, the blue-and-yellow **TO** icon appears in the Windows notification area. It may be under the **^** hidden-icons button. Right-click it to open the app, open the data folder, configure startup behavior, or safely exit.
 
@@ -160,6 +160,8 @@ Advanced examples:
 py -3 server.py --port 8766
 $env:TSI_DATA_DIR='D:\InventoryData'; py -3 server.py
 ```
+
+When no `--port` is supplied, the app checks ports `8765` through `8864` and uses the first available one. If necessary, Windows assigns another free localhost port. An explicit `--port` disables automatic selection, which is useful for shortcuts or integrations that require a fixed address. The active address is shown in the browser and under **Settings > Local address**.
 
 ## Database and file locations
 
@@ -250,8 +252,8 @@ git push origin v1.0.1
 
 ## Troubleshooting
 
-- If the browser does not open, visit `http://127.0.0.1:8765`.
-- If port `8765` is already in use, stop the other copy or run `py -3 server.py --port 8766`.
+- If the browser does not open, use the **Open Supply Inventory** tray command. The active address is also shown under **Settings > Local address**.
+- If port `8765` is already in use, the app automatically selects another localhost port. To require a specific port, run `py -3 server.py --port 8766`.
 - If Python is not found, reinstall Python and enable its PATH option.
 - If an update check fails, confirm internet access; inventory functions remain available offline.
 - If Excel warns that a downloaded file is blocked, right-click the file, open **Properties**, select **Unblock** when available, and reopen it.
