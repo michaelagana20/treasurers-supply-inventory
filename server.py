@@ -275,7 +275,7 @@ def build_xlsx(sheets):
         merge = f'<mergeCells count="1"><mergeCell ref="A1:{last_col}1"/></mergeCells>' if columns > 1 else ""
         auto_filter = f'<autoFilter ref="A4:{last_col}{last_row}"/>' if data else ""
         sheet_xml.append(f'''<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
-<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetViews><sheetView workbookViewId="0"><pane ySplit="4" topLeftCell="A5" activePane="bottomLeft" state="frozen"/></sheetView></sheetViews><cols>{cols_xml}</cols><sheetData>{"".join(rows_xml)}</sheetData>{merge}{auto_filter}<pageMargins left="0.3" right="0.3" top="0.5" bottom="0.5" header="0.2" footer="0.2"/></worksheet>''')
+<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetViews><sheetView workbookViewId="0"><pane ySplit="4" topLeftCell="A5" activePane="bottomLeft" state="frozen"/></sheetView></sheetViews><cols>{cols_xml}</cols><sheetData>{"".join(rows_xml)}</sheetData>{auto_filter}{merge}<pageMargins left="0.3" right="0.3" top="0.5" bottom="0.5" header="0.2" footer="0.2"/></worksheet>''')
         workbook_sheets.append(f'<sheet name={quoteattr(spec["name"][:31])} sheetId="{sheet_index}" r:id="rId{sheet_index}"/>')
         rels.append(f'<Relationship Id="rId{sheet_index}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet{sheet_index}.xml"/>')
         content_sheets.append(f'<Override PartName="/xl/worksheets/sheet{sheet_index}.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>')
